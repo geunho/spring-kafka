@@ -451,7 +451,7 @@ public abstract class AbstractMessageListenerContainer<K, V>
 	 * @return the {@link ConsumerRebalanceListener} currently assigned to this container.
 	 */
 	protected final ConsumerRebalanceListener createSimpleLoggingConsumerRebalanceListener() {
-		return new ConsumerRebalanceListener() {
+		return new ConsumerRebalanceListener() { // NOSONAR - anonymous inner class length
 
 			@Override
 			public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
@@ -463,6 +463,12 @@ public abstract class AbstractMessageListenerContainer<K, V>
 			public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
 				AbstractMessageListenerContainer.this.logger.info(() ->
 						getGroupId() + ": partitions assigned: " + partitions);
+			}
+
+			@Override
+			public void onPartitionsLost(Collection<TopicPartition> partitions) {
+				AbstractMessageListenerContainer.this.logger.info(() ->
+				getGroupId() + ": partitions lost: " + partitions);
 			}
 
 		};

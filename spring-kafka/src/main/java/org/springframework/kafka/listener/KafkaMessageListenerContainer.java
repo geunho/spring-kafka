@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2019 the original author or authors.
+ * Copyright 2016-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -122,6 +122,7 @@ import io.micrometer.core.instrument.Timer.Sample;
  * @author Chen Binbin
  * @author Yang Qiju
  * @author Tom van den Berge
+ * @author Lukasz Kaminski
  */
 public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 		extends AbstractMessageListenerContainer<K, V> {
@@ -566,6 +567,9 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 
 		private final boolean subBatchPerPartition = this.containerProperties.isSubBatchPerPartition();
 
+		private final Duration authorizationExceptionRetryInterval =
+				this.containerProperties.getAuthorizationExceptionRetryInterval();
+
 		private Map<TopicPartition, OffsetMetadata> definedPartitions;
 
 		private int count;
@@ -910,9 +914,19 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 					break;
 				}
 				catch (AuthorizationException ae) {
-					this.fatalError = true;
-					ListenerConsumer.this.logger.error(ae, "Authorization Exception");
-					break;
+					if (this.authorizationExceptionRetryInterval == null) {
+						ListenerConsumer.this.logger.error(ae, "Authorization Exception and no authorizationExceptionRetryInterval set");
+						this.fatalError = true;
+						break;
+					}
+					else {
+						ListenerConsumer.this.logger.error(ae, "Authorization Exception, retrying in " + this.authorizationExceptionRetryInterval.toMillis() + " ms");
+						// We can't pause/resume here, as KafkaConsumer doesn't take pausing
+						// into account when committing, hence risk of being flooded with
+						// GroupAuthorizationExceptions.
+						// see: https://github.com/spring-projects/spring-kafka/pull/1337
+						sleepFor(this.authorizationExceptionRetryInterval);
+					}
 				}
 				catch (Exception e) {
 					handleConsumerException(e);
@@ -949,7 +963,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			if (this.seeks.size() > 0) {
 				processSeeks();
 			}
-			checkPaused();
+			pauseConsumerIfNecessary();
 			this.lastPoll = System.currentTimeMillis();
 			this.polling.set(true);
 			ConsumerRecords<K, V> records = doPoll();
@@ -963,7 +977,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 				}
 				return;
 			}
-			checkResumed();
+			resumeConsumerIfNeccessary();
 			debugRecords(records);
 			if (records != null && records.count() > 0) {
 				if (this.containerProperties.getIdleEventInterval() != null) {
@@ -1020,7 +1034,16 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			}
 		}
 
-		private void checkPaused() {
+		private void sleepFor(Duration duration) {
+			try {
+				TimeUnit.MILLISECONDS.sleep(duration.toMillis());
+			}
+			catch (InterruptedException e) {
+				this.logger.error(e, "Interrupted while sleeping");
+			}
+		}
+
+		private void pauseConsumerIfNecessary() {
 			if (!this.consumerPaused && isPaused()) {
 				this.consumer.pause(this.consumer.assignment());
 				this.consumerPaused = true;
@@ -1029,7 +1052,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			}
 		}
 
-		private void checkResumed() {
+		private void resumeConsumerIfNeccessary() {
 			if (this.consumerPaused && !isPaused()) {
 				this.logger.debug(() -> "Resuming consumption from: " + this.consumer.paused());
 				Set<TopicPartition> paused = this.consumer.paused();
@@ -1111,6 +1134,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			}
 			if (this.consumerSeekAwareListener != null) {
 				this.consumerSeekAwareListener.onPartitionsRevoked(partitions);
+				this.consumerSeekAwareListener.unregisterSeekCallback();
 			}
 			this.logger.info(() -> getGroupId() + ": Consumer stopped");
 			publishConsumerStoppedEvent();
@@ -1416,7 +1440,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 					processCommits();
 				}
 				SeekUtils.doSeeks(toSeek, this.consumer, null, true, (rec, ex) -> false, this.logger);
-				this.nackSleep = -1;
+				nackSleepAndReset();
 			}
 		}
 
@@ -1584,6 +1608,10 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 				}
 			}
 			SeekUtils.doSeeks(list, this.consumer, null, true, (rec, ex) -> false, this.logger);
+			nackSleepAndReset();
+		}
+
+		private void nackSleepAndReset() {
 			try {
 				Thread.sleep(this.nackSleep);
 			}
@@ -2159,7 +2187,6 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 							? (ConsumerAwareRebalanceListener) this.userListener : null;
 
 			ListenerConsumerRebalanceListener() {
-				super();
 			}
 
 			@Override
@@ -2181,6 +2208,9 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 					if (ListenerConsumer.this.consumerSeekAwareListener != null) {
 						ListenerConsumer.this.consumerSeekAwareListener.onPartitionsRevoked(partitions);
 					}
+					if (ListenerConsumer.this.assignedPartitions != null) {
+						ListenerConsumer.this.assignedPartitions.removeAll(partitions);
+					}
 				}
 				finally {
 					if (ListenerConsumer.this.kafkaTxManager != null) {
@@ -2196,7 +2226,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 					ListenerConsumer.this.logger.warn("Paused consumer resumed by Kafka due to rebalance; "
 							+ "consumer paused again, so the initial poll() will never return any records");
 				}
-				ListenerConsumer.this.assignedPartitions = partitions;
+				ListenerConsumer.this.assignedPartitions = new LinkedList<>(partitions);
 				if (!ListenerConsumer.this.autoCommit) {
 					// Commit initial positions - this is generally redundant but
 					// it protects us from the case when another consumer starts
@@ -2271,12 +2301,22 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 				}
 			}
 
+			@Override
+			public void onPartitionsLost(Collection<TopicPartition> partitions) {
+				if (this.consumerAwareListener != null) {
+					this.consumerAwareListener.onPartitionsLost(ListenerConsumer.this.consumer, partitions);
+				}
+				else {
+					this.userListener.onPartitionsLost(partitions);
+				}
+				onPartitionsRevoked(partitions);
+			}
+
 		}
 
 		private final class InitialOrIdleSeekCallback implements ConsumerSeekCallback {
 
 			InitialOrIdleSeekCallback() {
-				super();
 			}
 
 			@Override

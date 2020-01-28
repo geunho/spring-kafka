@@ -194,11 +194,9 @@ The following listing shows the definition of the `ProducerListener` interface:
 ----
 public interface ProducerListener<K, V> {
 
-    void onSuccess(String topic, Integer partition, K key, V value, RecordMetadata recordMetadata);
+    void onSuccess(ProducerRecord<K, V> producerRecord, RecordMetadata recordMetadata);
 
-    void onError(String topic, Integer partition, K key, V value, Exception exception);
-
-    boolean isInterestedInSuccess();
+    void onError(ProducerRecord<K, V> producerRecord, Exception exception)
 
 }
 ----
@@ -206,10 +204,7 @@ public interface ProducerListener<K, V> {
 
 By default, the template is configured with a `LoggingProducerListener`, which logs errors and does nothing when the send is successful.
 
-`onSuccess` is called only if `isInterestedInSuccess` returns `true`.
-
-For convenience, the abstract `ProducerListenerAdapter` is provided in case you want to implement only one of the methods.
-It returns `false` for `isInterestedInSuccess`.
+For convenience, default method implementations are provided in case you want to implement only one of the methods.
 
 Notice that the send methods return a `ListenableFuture<SendResult>`.
 You can register a callback with the listener to receive the result of the send asynchronously.
@@ -503,10 +498,14 @@ The template in <<replying-template>> is strictly for a single request/reply sce
 For cases where multiple receivers of a single message return a reply, you can use the `AggregatingReplyingKafkaTemplate`.
 This is an implementation of the client-side of the https://www.enterpriseintegrationpatterns.com/patterns/messaging/BroadcastAggregate.html[Scatter-Gather Enterprise Integration Pattern].
 
-Like the `ReplyingKafkaTemplate`, the `AggregatingReplyingKafkaTemplate` constructor takes a producer factory and a listener container to receive the replies; it has a third parameter `Predicate<Collection<ConsumerRecord<K, R>>> releaseStrategy` which is consulted each time a reply is received; when the predicate returns `true`, the collection of `ConsumerRecord` s is used to complete the `Future` returned by the `sendAndReceive` method.
+Like the `ReplyingKafkaTemplate`, the `AggregatingReplyingKafkaTemplate` constructor takes a producer factory and a listener container to receive the replies; it has a third parameter `BiPredicate<List<ConsumerRecord<K, R>>, Boolean> releaseStrategy` which is consulted each time a reply is received; when the predicate returns `true`, the collection of `ConsumerRecord` s is used to complete the `Future` returned by the `sendAndReceive` method.
 
 There is an additional property `returnPartialOnTimeout` (default false).
 When this is set to `true`, instead of completing the future with a `KafkaReplyTimeoutException`, a partial result completes the future normally (as long as at least one reply record has been received).
+
+Starting with version 2.3.5, the predicate is also called after a timeout (if `returnPartialOnTimeout` is `true`).
+The first argument is the current list of records; the second is `true` if this call is due to a timeout.
+The predicate can modify the list of records.
 
 ====
 [source, java]
@@ -752,6 +751,13 @@ This prevents the container from starting if any of the configured topics are no
 It does not apply if the container is configured to listen to a topic pattern (regex).
 Previously, the container threads looped within the `consumer.poll()` method waiting for the topic to appear while logging many messages.
 Aside from the logs, there was no indication that there was a problem.
+
+As of version 2.3.5, a new container property called `authorizationExceptionRetryInterval` has been introduced.
+This causes the container to retry fetching messages after getting any `AuthorizationException` from `KafkaConsumer`.
+This can happen when, for example, the configured user is denied access to read certain topic.
+Defining `authorizationExceptionRetryInterval` should help the application to recover as soon as proper permissions are granted.
+
+NOTE: By default, no interval is configured - authorization errors are considered fatal, which causes the container to stop.
 
 [[using-ConcurrentMessageListenerContainer]]
 ====== Using `ConcurrentMessageListenerContainer`
@@ -1496,6 +1502,8 @@ public interface ConsumerAwareRebalanceListener extends ConsumerRebalanceListene
 
     void onPartitionsAssigned(Consumer<?, ?> consumer, Collection<TopicPartition> partitions);
 
+    void onPartitionsLost(Consumer<?, ?> consumer, Collection<TopicPartition> partitions);
+
 }
 ----
 ====
@@ -1531,6 +1539,14 @@ containerProperties.setConsumerRebalanceListener(new ConsumerAwareRebalanceListe
 });
 ----
 ====
+
+IMPORTANT: Starting with version 2.4, a new method `onPartitionsLost()` has been added (similar to a method with the same name in `ConsumerRebalanceLister`).
+The default implementation on `ConsumerRebalanceLister` simply calls `onPartionsRevoked`.
+The default implementation on `ConsumerAwareRebalanceListener` does nothing.
+When supplying the listener container with a custom listener (of either type), it is important that your implementation not call `onPartitionsRevoked` from `onPartitionsLost`.
+If you implement `ConsumerRebalanceListener` you should override the default method.
+This is because the listener container will call its own `onPartitionsRevoked` from its implementation of `onPartitionsLost` after calling the method on your implementation.
+If you implementation delegates to the default behavior, `onPartitionsRevoked` will be called twice each time the `Consumer` calls that method on the container's listener.
 
 [[annotation-send-to]]
 ===== Forwarding Listener Results using `@SendTo`
@@ -1722,6 +1738,11 @@ public KafkaListenerErrorHandler voidSendToErrorHandler() {
 
 See <<annotation-error-handling>> for more information.
 ====
+
+NOTE: If a listener method returns an `Iterable`, by default a record for each element as the value is sent.
+Starting with version 2.3.5, set the `splitIterables` property on `@KafkaListener` to `false` and the entire result will be sent as the value of a single `ProducerRecord`.
+This requires a suitable serializer in the reply template's producer configuration.
+However, if the reply is `Iterable<Message<?>>` the property is ignored and each message is sent separately.
 
 ===== Filtering Messages
 
@@ -2719,7 +2740,8 @@ A `JacksonMimeTypeModule` can be registered as a bean in the application context
 Also starting with version 2.3, the `JsonDeserializer` provides `TypeReference`-based constructors for better handling of target generic container types.
 
 Starting with version 2.1, you can convey type information in record `Headers`, allowing the handling of multiple types.
-In addition, you can configure the serializer and deserializer by using the following Kafka properties:
+In addition, you can configure the serializer and deserializer by using the following Kafka properties.
+They have no effect if you have provided `Serializer` and `Deserializer` instances for `KafkaConsumer` and `KafkaProducer`, respectively.
 
 * `JsonSerializer.ADD_TYPE_INFO_HEADERS` (default `true`): You can set it to `false` to disable this feature on the `JsonSerializer` (sets the `addTypeInfo` property).
 * `JsonSerializer.TYPE_MAPPINGS` (default `empty`): See <<serdes-mapping-types>>.
@@ -3135,6 +3157,41 @@ This lets you further customize listener deserialization without changing the de
 
 IMPORTANT: Setting a custom `MessageHandlerMethodFactory` on the `KafkaListenerEndpointRegistrar` through a `KafkaListenerConfigurer` bean disables this feature.
 
+===== Adding custom `HandlerMethodArgumentResolver` to `@KafkaListener`
+
+Starting with version 2.4.2 you are able to add your own `HandlerMethodArgumentResolver` and resolve custom method parameters.
+All you need is to implement `KafkaListenerConfigurer` and use method `setCustomMethodArgumentResolvers()` from class `KafkaListenerEndpointRegistrar`.
+
+====
+[source, java]
+----
+@Configuration
+class CustomKafkaConfig implements KafkaListenerConfigurer {
+
+    @Override
+    public void configureKafkaListeners(KafkaListenerEndpointRegistrar registrar) {
+        registrar.setCustomMethodArgumentResolvers(
+            new HandlerMethodArgumentResolver() {
+
+                @Override
+                public boolean supportsParameter(MethodParameter parameter) {
+                    return CustomMethodArgument.class.isAssignableFrom(parameter.getParameterType());
+                }
+
+                @Override
+                public Object resolveArgument(MethodParameter parameter, Message<?> message) {
+                    return new CustomMethodArgument(
+                        message.getHeaders().get(KafkaHeaders.RECEIVED_TOPIC, String.class)
+                    );
+                }
+            }
+        );
+    }
+
+}
+----
+====
+
 [[headers]]
 ==== Message Headers
 
@@ -3445,10 +3502,7 @@ When transactions are being used, no error handlers are configured, by default, 
 If you provide a custom error handler when using transactions, it must throw an exception if you want the transaction rolled back.
 
 Starting with version 2.3.2, these interfaces have a default method `isAckAfterHandle()` which is called by the container to determine whether the offset(s) should be committed if the error handler returns without throwing an exception.
-This returns false by default, for backwards compatibility.
-In most cases, however, we expect that the offset should be committed.
-For example, the <<seek-to-current, `SeekToCurrentErrorHandler`>> returns `true` if a record is recovered (after any retries, if so configured).
-In a future release, we expect to change this default to `true`.
+Starting with version 2.4, this returns true by default.
 
 You can specify a global error handler to be used for all listeners in the container factory.
 The following example shows how to do so:

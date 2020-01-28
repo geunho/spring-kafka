@@ -25,6 +25,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willAnswer;
+import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -66,6 +67,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.AuthorizationException;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.junit.jupiter.api.BeforeAll;
@@ -110,6 +112,8 @@ import org.springframework.util.backoff.FixedBackOff;
  * @author Martin Dam
  * @author Artem Bilan
  * @author Loic Talhouarne
+ * @author Lukasz Kaminski
+ * @author Ray Chuan Tay
  */
 @EmbeddedKafka(topics = { KafkaMessageListenerContainerTests.topic1, KafkaMessageListenerContainerTests.topic2,
 		KafkaMessageListenerContainerTests.topic3, KafkaMessageListenerContainerTests.topic4,
@@ -172,6 +176,8 @@ public class KafkaMessageListenerContainerTests {
 	public static final String topic22 = "testTopic22";
 
 	public static final String topic23 = "testTopic23";
+
+	public static final String topic24 = "testTopic24";
 
 	private static EmbeddedKafkaBroker embeddedKafka;
 
@@ -1891,6 +1897,47 @@ public class KafkaMessageListenerContainerTests {
 	}
 
 	@Test
+	public void testJsonSerDeWithInstanceDoesNotUseConfiguration() throws Exception {
+		this.logger.info("Start JSON1a");
+		Class<Foo1> consumerConfigValueDefaultType = Foo1.class;
+		Map<String, Object> props = KafkaTestUtils.consumerProps("testJson", "false", embeddedKafka);
+		props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+		props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, consumerConfigValueDefaultType);
+		DefaultKafkaConsumerFactory<Integer, Foo> cf = new DefaultKafkaConsumerFactory<>(props, null, new JsonDeserializer<>(Foo.class));
+		ContainerProperties containerProps = new ContainerProperties(topic24);
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		final AtomicReference<ConsumerRecord<?, ?>> received = new AtomicReference<>();
+		containerProps.setMessageListener((MessageListener<Integer, Foo>) record -> {
+			KafkaMessageListenerContainerTests.this.logger.info("json: " + record);
+			received.set(record);
+			latch.countDown();
+		});
+
+		KafkaMessageListenerContainer<Integer, Foo> container =
+				new KafkaMessageListenerContainer<>(cf, containerProps);
+		container.setBeanName("testJson1a");
+		container.start();
+
+		ContainerTestUtils.waitForAssignment(container, embeddedKafka.getPartitionsPerTopic());
+
+		Map<String, Object> senderProps = KafkaTestUtils.producerProps(embeddedKafka);
+		senderProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+		DefaultKafkaProducerFactory<Integer, Foo> pf = new DefaultKafkaProducerFactory<>(senderProps);
+		KafkaTemplate<Integer, Foo> template = new KafkaTemplate<>(pf);
+		template.setDefaultTopic(topic24);
+		template.sendDefault(0, new Foo("bar"));
+		template.flush();
+		assertThat(latch.await(60, TimeUnit.SECONDS)).isTrue();
+		assertThat(received.get().value())
+				.isInstanceOf(Foo.class)
+				.isNotInstanceOf(consumerConfigValueDefaultType);
+		container.stop();
+		pf.destroy();
+		this.logger.info("Stop JSON1a");
+	}
+
+	@Test
 	public void testJsonSerDeHeaderSimpleType() throws Exception {
 		this.logger.info("Start JSON2");
 		Map<String, Object> props = KafkaTestUtils.consumerProps("testJson", "false", embeddedKafka);
@@ -2655,6 +2702,37 @@ public class KafkaMessageListenerContainerTests {
 		container.stop();
 	}
 
+	@SuppressWarnings({ "unchecked", "rawtypes" })
+	@Test
+	void testFatalErrorOnAuthorizationException() throws Exception {
+		ConsumerFactory<Integer, String> cf = mock(ConsumerFactory.class);
+		Consumer<Integer, String> consumer = mock(Consumer.class);
+		given(cf.createConsumer(eq("grp"), eq("clientId"), isNull(), any())).willReturn(consumer);
+		given(cf.getConfigurationProperties()).willReturn(new HashMap<>());
+
+		willThrow(AuthorizationException.class)
+				.given(consumer).poll(any());
+
+		ContainerProperties containerProps = new ContainerProperties(topic1);
+		containerProps.setGroupId("grp");
+		containerProps.setClientId("clientId");
+		containerProps.setMessageListener((MessageListener) r -> { });
+		KafkaMessageListenerContainer<Integer, String> container =
+				new KafkaMessageListenerContainer<>(cf, containerProps);
+
+		CountDownLatch stopping = new CountDownLatch(1);
+
+		container.setApplicationEventPublisher(e -> {
+			if (e instanceof ConsumerStoppingEvent) {
+				stopping.countDown();
+			}
+		});
+
+		container.start();
+		assertThat(stopping.await(10, TimeUnit.SECONDS)).isTrue();
+		container.stop();
+	}
+
 	private Consumer<?, ?> spyOnConsumer(KafkaMessageListenerContainer<Integer, String> container) {
 		Consumer<?, ?> consumer = spy(
 				KafkaTestUtils.getPropertyValue(container, "listenerConsumer.consumer", Consumer.class));
@@ -2691,7 +2769,6 @@ public class KafkaMessageListenerContainerTests {
 		private String bar;
 
 		public Foo() {
-			super();
 		}
 
 		public Foo(String bar) {
@@ -2718,7 +2795,6 @@ public class KafkaMessageListenerContainerTests {
 		private String bar;
 
 		public Foo1() {
-			super();
 		}
 
 		public Foo1(String bar) {
@@ -2745,7 +2821,6 @@ public class KafkaMessageListenerContainerTests {
 		private String baz;
 
 		public Bar() {
-			super();
 		}
 
 		public Bar(String baz) {
@@ -2774,7 +2849,6 @@ public class KafkaMessageListenerContainerTests {
 		private String baz;
 
 		public Bar1() {
-			super();
 		}
 
 		public Bar1(String baz) {

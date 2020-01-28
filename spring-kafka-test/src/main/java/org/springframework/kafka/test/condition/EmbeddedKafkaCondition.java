@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 the original author or authors.
+ * Copyright 2019-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -115,9 +115,10 @@ public class EmbeddedKafkaCondition implements ExecutionCondition, AfterAllCallb
 	@SuppressWarnings("unchecked")
 	private EmbeddedKafkaBroker createBroker(EmbeddedKafka embedded) {
 		EmbeddedKafkaBroker broker;
+		int[] ports = setupPorts(embedded);
 		broker = new EmbeddedKafkaBroker(embedded.count(), embedded.controlledShutdown(), embedded.topics())
 				.zkPort(embedded.zookeeperPort())
-				.kafkaPorts(embedded.ports());
+				.kafkaPorts(ports);
 		Properties properties = new Properties();
 
 		for (String pair : embedded.brokerProperties()) {
@@ -156,6 +157,14 @@ public class EmbeddedKafkaCondition implements ExecutionCondition, AfterAllCallb
 		}
 		broker.afterPropertiesSet();
 		return broker;
+	}
+
+	private int[] setupPorts(EmbeddedKafka embedded) {
+		int[] ports = embedded.ports();
+		if (embedded.count() > 1 && ports.length == 1 && ports[0] == 0) {
+			ports = new int[embedded.count()];
+		}
+		return ports;
 	}
 
 	private EmbeddedKafkaBroker getBrokerFromStore(ExtensionContext context) {

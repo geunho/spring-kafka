@@ -34,7 +34,6 @@ import org.springframework.kafka.support.converter.MessageConverter;
 class KafkaListenerEndpointAdapter implements KafkaListenerEndpoint {
 
 	KafkaListenerEndpointAdapter() {
-		super();
 	}
 
 	@Override
@@ -85,6 +84,11 @@ class KafkaListenerEndpointAdapter implements KafkaListenerEndpoint {
 	@Override
 	public void setupListenerContainer(MessageListenerContainer listenerContainer,
 			MessageConverter messageConverter) {
+	}
+
+	@Override
+	public boolean isSplitIterables() {
+		return true;
 	}
 
 }
